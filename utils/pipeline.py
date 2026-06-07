@@ -514,22 +514,21 @@ def _find_typ_files(raw_dir: Path) -> list[Path]:
 
 def stage4_pack_and_transform(raw_dir: Path):
     """
-    每个象限:
-      1. gmt -j 合并为 quadrant.img (带唯一 FID/名称)
-      2. garmin_forge 在合图上做 wgs2gcj 加偏
-      3. 复制 .typ 样式文件到输出目录
+    每个象限，严格四步流水:
+      1. gmt -j     合并打包 (含原始 TYP)
+      2. gmt -w -y  强刷内嵌 TYP 的 FID/PID
+      3. gmt -i     熔断校验 (Sanity Check)
+      4. garmin_forge  WGS-84 → GCJ-02 加偏
     """
     log("=" * 60)
-    log("阶段 4/5: 合成 + 加偏")
+    log("阶段 4/5: 合成 + 强刷皮肤 + 加偏")
     log("=" * 60)
 
     output_dir = ensure_dir(OUTPUT)
 
-    # 查找 .typ 文件并拷贝到输出目录
+    # 查找原始 TYP 文件（要在打包时作为输入源）
     typ_files = _find_typ_files(raw_dir)
-    for typ_f in typ_files:
-        shutil.copy2(typ_f, output_dir / typ_f.name)
-        log(f"  样式文件: {typ_f.name} → output/")
+    typ_paths = [str(f) for f in typ_files]
 
     for q in QUADRANTS:
         quad_dir = TILES_QUAD / q["name"]
@@ -540,40 +539,83 @@ def stage4_pack_and_transform(raw_dir: Path):
             continue
 
         output_file = output_dir / f"China_{q['name']}.img"
+        fid_pid = f"{q['fid']},{q['pid']}"
 
         log(f"{q['name']}: {len(tile_files)} tiles → {output_file.name}")
         log(f"  FID={q['fid']}, PID={q['pid']}, MapName={q['label']}")
 
-        # 合成 (带唯一 FID + PID + 地图名，防止手表变砖)
+        # ═══════════════════════════════════════════════════════
+        #  动作 1: 打包 (Join) — 原始 TYP + 所有 tile 一并输入
+        # ═══════════════════════════════════════════════════════
         gmt_cmd = [
             str(GMT), "-j",
-            "-f", f"{q['fid']},{q['pid']}",
+            "-f", fid_pid,
             "-m", q["label"],
             "-o", str(output_file),
         ]
+        gmt_cmd.extend(typ_paths)
+        gmt_cmd.extend(str(f) for f in tile_files)
 
-        # 将 .typ 也加入合成输入（如果有）
-        for typ_f in typ_files:
-            gmt_cmd.append(str(typ_f))
-
-        gmt_cmd += [str(f) for f in tile_files]
-
-        run_cmd(gmt_cmd, desc=f"gmt 合成 {q['name']}", timeout=3600)
+        run_cmd(gmt_cmd, desc=f"gmt 打包 {q['name']}", timeout=3600)
 
         if not output_file.exists():
-            log(f"  ✗ {output_file.name} 合成失败", "ERROR")
+            log(f"  ✗ {output_file.name} 打包失败", "ERROR")
             continue
 
-        log(f"  合成完成: {megabytes(output_file):.1f} MB")
+        log(f"  打包完成: {megabytes(output_file):.1f} MB")
 
-        # 加偏
+        # ═══════════════════════════════════════════════════════
+        #  动作 2: 强刷内嵌 TYP (Correct) — 洗白 FID/PID
+        # ═══════════════════════════════════════════════════════
+        log(f"  强刷内嵌 TYP: FID={q['fid']}, PID={q['pid']}...")
+        correct_cmd = [
+            str(GMT), "-w", "-y", fid_pid,
+            str(output_file),
+        ]
+        run_cmd(correct_cmd, desc=f"gmt 修正 {q['name']} TYP", timeout=120)
+
+        # ═══════════════════════════════════════════════════════
+        #  动作 3: 熔断校验 (Sanity Check)
+        # ═══════════════════════════════════════════════════════
+        log("  执行结构安全校验 (Sanity Check)...")
+        try:
+            info_out = subprocess.check_output(
+                [str(GMT), "-i", str(output_file)],
+                text=True, timeout=30)
+        except subprocess.CalledProcessError as e:
+            log(f"  ✗ 熔断: gmt -i 返回错误 (code {e.returncode})", "ERROR")
+            log(f"     {e.stderr[:200] if e.stderr else ''}")
+            continue
+
+        # 断言 1: 必须包含 TYP
+        if "TYP" not in info_out:
+            log(f"  ✗ 熔断: {output_file.name} 中未发现 TYP 皮肤！", "ERROR")
+            output_file.unlink(missing_ok=True)
+            continue
+
+        # 断言 2: TYP 的 FID 和 PID 必须正确
+        if f"FID {q['fid']}" not in info_out:
+            log(f"  ✗ 熔断: TYP FID 应为 {q['fid']} 但修正失败！", "ERROR")
+            output_file.unlink(missing_ok=True)
+            continue
+
+        if f"PID {q['pid']}" not in info_out:
+            log(f"  ✗ 熔断: TYP PID 应为 {q['pid']} 但修正失败！", "ERROR")
+            output_file.unlink(missing_ok=True)
+            continue
+
+        log("  ✓ 皮肤验证完美通过！")
+
+        # ═══════════════════════════════════════════════════════
+        #  动作 4: 加偏 (Transform)
+        # ═══════════════════════════════════════════════════════
         log(f"  WGS-84 → GCJ-02 加偏...")
         run_cmd(
             [str(GARMIN_FORGE), str(output_file)],
             desc=f"garmin_forge {q['name']}",
             timeout=3600,
         )
-        log(f"  ✓ {output_file.name} 加偏完成")
+        log(f"  ✓ {output_file.name} 全部完成")
 
 
 # ============================================================
