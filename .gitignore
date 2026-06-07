@@ -1,0 +1,18 @@
+# 运行时工作目录
+work/
+output/
+
+# 编译产物
+src/*.o
+utils/garmin_forge
+
+# OS 临时文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
