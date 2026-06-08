@@ -514,7 +514,8 @@ def _find_typ_files(raw_dir: Path) -> list[Path]:
 
 def stage4_pack_and_transform(raw_dir: Path):
     """
-    每个象限，严格四步流水:
+    每个象限，严格五步流水:
+      0. gmt -w -z  预清洗子瓦片 FID/PID（关键：统一后才能合并 MPS 为 1 行）
       1. gmt -j     合并打包 (含原始 TYP)
       2. gmt -w -y  强刷内嵌 TYP 的 FID/PID
       3. gmt -i     熔断校验 (Sanity Check)
@@ -545,6 +546,18 @@ def stage4_pack_and_transform(raw_dir: Path):
         log(f"  FID={q['fid']}, PID={q['pid']}, MapName={q['label']}")
 
         # ═══════════════════════════════════════════════════════
+        #  动作 0: 预清洗子瓦片 MPS (关键步骤)
+        #    全部刷成目标 FID/PID，这样 gmt -j 合并时 MPS 自动归并为 1 行。
+        #    不先做这步的话，join 后 MPS 会有 N 行残留，-z 只能改值不能删行。
+        # ═══════════════════════════════════════════════════════
+        log(f"  预清洗 {len(tile_files)} 个子瓦片 FID/PID → {fid_pid}...")
+        for tf in tile_files:
+            run_cmd(
+                [str(GMT), "-w", "-z", fid_pid, str(tf)],
+                desc=f"预清洗 {tf.name}", timeout=30,
+            )
+
+        # ═══════════════════════════════════════════════════════
         #  动作 1: 打包 (Join) — 原始 TYP + 所有 tile 一并输入
         # ═══════════════════════════════════════════════════════
         gmt_cmd = [
@@ -565,9 +578,11 @@ def stage4_pack_and_transform(raw_dir: Path):
         log(f"  打包完成: {megabytes(output_file):.1f} MB")
 
         # ═══════════════════════════════════════════════════════
-        #  动作 2: 强刷内嵌 TYP (Correct) — 洗白 FID/PID
+        #  动作 2: 强刷 TYP 内嵌 FID/PID (皮肤修正)
+        #    原始 TYP 的 FID=33177 与目标象限 FID 不匹配，
+        #    手表无法识别皮肤会变成丑陋的默认配色。
         # ═══════════════════════════════════════════════════════
-        log(f"  强刷内嵌 TYP: FID={q['fid']}, PID={q['pid']}...")
+        log(f"  强刷 TYP 皮肤: FID={q['fid']}, PID={q['pid']}...")
         correct_cmd = [
             str(GMT), "-w", "-y", fid_pid,
             str(output_file),
@@ -587,7 +602,7 @@ def stage4_pack_and_transform(raw_dir: Path):
             log(f"     {e.stderr[:200] if e.stderr else ''}")
             continue
 
-        # 断言 1: 必须包含 TYP
+        # 断言 1: TYP 必须存在
         if "TYP" not in info_out:
             log(f"  ✗ 熔断: {output_file.name} 中未发现 TYP 皮肤！", "ERROR")
             output_file.unlink(missing_ok=True)
@@ -604,7 +619,19 @@ def stage4_pack_and_transform(raw_dir: Path):
             output_file.unlink(missing_ok=True)
             continue
 
-        log("  ✓ 皮肤验证完美通过！")
+        # 断言 3: Data MPS 必须只有 1 行 (无子瓦片残留)
+        mps_count = info_out.count("F: PID")
+        if mps_count > 1:
+            log(f"  ✗ 熔断: Data MPS 有 {mps_count} 行残留 (预期 1 行)！", "ERROR")
+            log(f"     这不应该发生（子瓦片已预清洗），请检查 gmt -w -z 是否全部成功")
+            output_file.unlink(missing_ok=True)
+            continue
+        elif mps_count == 0:
+            log(f"  ⚠ 警告: Data MPS 未找到 F: PID 行", "WARN")
+        else:
+            log(f"  ✓ Data MPS 干净: 仅 {mps_count} 行")
+
+        log("  ✓ 全部校验通过！")
 
         # ═══════════════════════════════════════════════════════
         #  动作 4: 加偏 (Transform)
